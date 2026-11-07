@@ -1211,3 +1211,9 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: TDM BE fixup (4ch/S32) and DSP_B/IB_NF CPU format for `lenovo,tb710fu-sndcard` only. The TDM endpoint has no bit-clock inversion setting, so IB_NF is sent as plain DSP_B; the values match what the vendor userspace programs.
+
+- `patches/0066a-drm-msm-dpu-fix-c3-vertical-extension.patch`
+  source: tb322fc-linux C3 vertical-extension correction.
+- `patches/0066b-drm-msm-dpu-qseed-rotation-calculator.patch`
+  source: tb322fc-linux QSEED compatibility adapter, generalized for compatible devices.
+  notes: Executes the checksum-pinned Android QSEED library in kernel context for supported RGB rotations; falls back to the existing scaler otherwise.

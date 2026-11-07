@@ -10,6 +10,8 @@
 0048b-drm-msm-dsi-fix-pll-init-in-bonded-mode.patch
 0049-drm-msm-dpu-panel-opt-in-8bpc-dither.patch
 0066-drm-msm-dpu-enable-inline-rotation.patch
+0066a-drm-msm-dpu-fix-c3-vertical-extension.patch
+0066b-drm-msm-dpu-qseed-rotation-calculator.patch
 0068-drm-msm-dpu-lutdma-dspp-igc-gamut.patch
 0069-dt-bindings-display-msm-dpu-lutdma-reg.patch
 0070-arm64-dts-qcom-dpu-lutdma-reg.patch

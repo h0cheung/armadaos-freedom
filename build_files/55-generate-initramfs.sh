@@ -41,6 +41,7 @@ dracut \
     --reproducible \
     --xz \
     --kver "${KVER}" \
+    --install /usr/lib/firmware/qcom/libqseed3.so \
     --add ostree \
     --add armada-splash \
     --add armada-ostree-fallback \
@@ -50,6 +51,7 @@ dracut \
 # dracut drops modules silently: fail the build rather than ship without.
 # Exact match: a substring test lets armada-splash-launcher pass for the binary.
 required=(
+    usr/lib/firmware/qcom/libqseed3.so \
     usr/lib/systemd/system/armada-splash-initrd.service \
     usr/lib/systemd/system/dracut-pre-mount.service.d/armada-splash.conf \
     usr/libexec/armada/armada-splash \

@@ -1,0 +1,18 @@
+From: TB322FC maintainers
+Subject: [PATCH] drm/msm/dpu: use vertical pixel extension for component 3
+
+The component 3 TB register incorrectly receives the LR configuration.
+Use the computed TB value so nonzero vertical fetching also applies to
+the alpha component. Existing zero-extension settings are unaffected.
+
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.c
+@@ -438,7 +438,7 @@
+ 
+ 	/* color 3 */
+ 	DPU_REG_WRITE(c, SSPP_SW_PIX_EXT_C3_LR, lr_pe[3]);
+-	DPU_REG_WRITE(c, SSPP_SW_PIX_EXT_C3_TB, lr_pe[3]);
++	DPU_REG_WRITE(c, SSPP_SW_PIX_EXT_C3_TB, tb_pe[3]);
+ 	DPU_REG_WRITE(c, SSPP_SW_PIX_EXT_C3_REQ_PIXELS,
+ 			tot_req_pixels[3]);
+ }

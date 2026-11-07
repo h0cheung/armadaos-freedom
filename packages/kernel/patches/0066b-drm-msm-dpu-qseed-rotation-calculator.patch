@@ -1,0 +1,966 @@
+From: TB322FC maintainers
+Subject: [PATCH] drm/msm/dpu: calculate rotated QSEED sampling
+
+Use the checksum-pinned QSEED 1.5.7 calculator for supported packed RGB
+rotation, and retain the existing scaler when calculation is unavailable.
+
+diff --git a/drivers/gpu/drm/msm/Kconfig b/drivers/gpu/drm/msm/Kconfig
+index 250246f..061b001 100644
+--- a/drivers/gpu/drm/msm/Kconfig
++++ b/drivers/gpu/drm/msm/Kconfig
+@@ -112,6 +112,18 @@ config DRM_MSM_DPU
+ 	  the MSM DRM driver. It is the display controller found in devices
+ 	  using e.g. SDM845 and newer platforms.
+ 
++config DRM_MSM_QSEED_COMPAT
++	bool "Qualcomm QSEED calculator compatibility"
++	depends on DRM_MSM=y && DRM_MSM_DPU && ARM64 && KERNEL_MODE_NEON
++	depends on ARM64_4K_PAGES && !SHADOW_CALL_STACK
++	select FW_LOADER
++	select CRYPTO_LIB_SHA256
++	help
++	  Load the separately supplied, checksum-pinned QSEED library
++	  for native and upscaled packed RGB sampling. Unsupported geometry
++	  or calculation failures retain the driver's existing configuration.
++	  This option requires the MSM driver to be built into the kernel.
++
+ config DRM_MSM_DP
+ 	bool "Enable DisplayPort support in MSM DRM driver"
+ 	depends on DRM_MSM
+diff --git a/drivers/gpu/drm/msm/Makefile b/drivers/gpu/drm/msm/Makefile
+index 45f4c2c..8e07bdf 100644
+--- a/drivers/gpu/drm/msm/Makefile
++++ b/drivers/gpu/drm/msm/Makefile
+@@ -163,6 +163,9 @@ msm-display-$(CONFIG_DRM_MSM_DSI_14NM_PHY) += dsi/phy/dsi_phy_14nm.o
+ msm-display-$(CONFIG_DRM_MSM_DSI_10NM_PHY) += dsi/phy/dsi_phy_10nm.o
+ msm-display-$(CONFIG_DRM_MSM_DSI_7NM_PHY) += dsi/phy/dsi_phy_7nm.o
+ 
++msm-display-$(CONFIG_DRM_MSM_QSEED_COMPAT) += disp/dpu1/dpu_qseed_compat.o \
++	disp/dpu1/dpu_qseed_invoke.o
++
+ msm-y += $(adreno-y)
+ msm-$(CONFIG_DRM_MSM_KMS) += $(msm-display-y)
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+index 6f09f08..cfe2da6 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+@@ -9,6 +9,9 @@
+ 
+ #include <linux/debugfs.h>
+ #include <linux/dma-buf.h>
++#include <linux/of.h>
++#include <linux/moduleparam.h>
++#include "dpu_qseed_compat.h"
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_uapi.h>
+@@ -58,6 +61,11 @@
+ 
+ #define DEFAULT_REFRESH_RATE	60
+ 
++/* Applied when the plane is next programmed. */
++static bool dpu_binary_qseed = true;
++module_param(dpu_binary_qseed, bool, 0600);
++MODULE_PARM_DESC(dpu_binary_qseed, "Use the pinned QSEED calculator for RGB rotation/scaling");
++
+ static const uint32_t qcom_compressed_supported_formats[] = {
+ 	DRM_FORMAT_ABGR8888,
+ 	DRM_FORMAT_ARGB8888,
+@@ -528,9 +536,145 @@ static const struct dpu_csc_cfg *_dpu_plane_get_csc(struct dpu_sw_pipe *pipe,
+ 	return csc_ptr;
+ }
+ 
++/* The binary is optional; failures preserve the normal scaler configuration. */
++static bool dpu_plane_setup_binary_qseed(
++	const struct drm_plane_state *state, const struct dpu_sw_pipe *pipe,
++	const struct dpu_sw_pipe_cfg *cfg, const struct msm_format *fmt,
++	const struct drm_format_info *info, struct dpu_hw_scaler3_cfg *scale,
++	struct dpu_hw_pixel_ext *ext)
++{
++#if IS_ENABLED(CONFIG_DRM_MSM_QSEED_COMPAT)
++	const struct dpu_plane_state *pstate;
++	struct dpu_qseed_input input = { 0 };
++	struct dpu_qseed_result result;
++	const struct dpu_qseed_path *p;
++	struct device *dev;
++	u32 i, n, index, count;
++
++	if (!READ_ONCE(dpu_binary_qseed) || !state || !state->fb ||
++	    state->rotation != DRM_MODE_ROTATE_270 ||
++	    cfg->rotation != DRM_MODE_ROTATE_90 ||
++	    pipe->sspp->cap->sblk->scaler_blk.version != 0x30004 ||
++	    pipe->multirect_index != DPU_SSPP_RECT_SOLO ||
++	    pipe->multirect_mode != DPU_SSPP_MULTIRECT_NONE ||
++	    MSM_FORMAT_IS_YUV(fmt) || info->num_planes != 1 ||
++	    info->cpp[0] != 4 || info->hsub != 1 || info->vsub != 1 ||
++	    ((state->src.x1 | state->src.y1 | state->src.x2 | state->src.y2) &
++	     0xffff) ||
++	    state->dst.x1 || state->dst.y1 || state->dst.x2 <= 0 ||
++	    state->dst.y2 <= 0 || state->dst.x2 > 8192 || state->dst.y2 > 8192)
++		return false;
++	input.fb_width = state->fb->width;
++	input.fb_height = state->fb->height;
++	input.src_x = state->src.x1 >> 16;
++	input.src_y = state->src.y1 >> 16;
++	input.src_width = drm_rect_width(&state->src) >> 16;
++	input.src_height = drm_rect_height(&state->src) >> 16;
++	input.dst_height = state->dst.y2;
++	input.ten_bit = !!MSM_FORMAT_IS_DX(fmt);
++	/* First cover native and upscaled packed RGB; no new downscale filters. */
++	if (input.src_width < 32 || input.src_height < 32 ||
++	    input.src_width > input.dst_height || input.src_height > state->dst.x2 ||
++	    input.fb_width > 8192 || input.fb_height > 8192)
++		return false;
++	pstate = to_dpu_plane_state(state);
++	count = drm_rect_width(&pstate->pipe_cfg[1].src_rect) ? 2 : 1;
++	index = cfg == &pstate->pipe_cfg[0] ? 0 : 1;
++	if (index >= count || cfg != &pstate->pipe_cfg[index])
++		return false;
++	for (n = 0; n < count; n++) {
++		if (pstate->pipe_cfg[n].dst_rect.y1 != state->dst.y1 ||
++		    pstate->pipe_cfg[n].dst_rect.y2 != state->dst.y2 ||
++		    !pstate->pipe[n].sspp ||
++		    pstate->pipe[n].sspp->cap->sblk->scaler_blk.version !=
++			    0x30004 ||
++		    pstate->pipe[n].multirect_index != DPU_SSPP_RECT_SOLO ||
++		    pstate->pipe[n].multirect_mode != DPU_SSPP_MULTIRECT_NONE)
++			return false;
++		input.dst_width[n] =
++			drm_rect_width(&pstate->pipe_cfg[n].dst_rect);
++	}
++	if (input.dst_width[0] + input.dst_width[1] != state->dst.x2)
++		return false;
++	dev = state->plane->dev->dev;
++	if (dpu_qseed_calculate(dev, &input, &result))
++		return false;
++	if (!result.step_x || result.step_x > 0xffffff || !result.step_y ||
++	    result.step_y > 0xffffff)
++		goto invalid;
++	/* Validate both pipes before applying either pipe's result. */
++	for (n = 0; n < count; n++) {
++		const struct drm_rect *src = &pstate->pipe_cfg[n].src_rect;
++		const struct drm_rect *dst = &pstate->pipe_cfg[n].dst_rect;
++		p = &result.path[n];
++		if (p->src_x != src->x1 || p->src_y != src->y1 ||
++		    p->src_width != drm_rect_width(src) ||
++		    p->src_height != drm_rect_height(src) ||
++		    p->dst_x != dst->x1 || p->dst_y != dst->y1 ||
++		    p->dst_width != drm_rect_width(dst) ||
++		    p->dst_height != drm_rect_height(dst) ||
++		    p->phase_x > 0x1fffff || p->phase_y > 0x1fffff ||
++		    p->preload_x > 127 || p->preload_y > 127 || !p->width ||
++		    p->width > 1088 || !p->height || p->height > 8192)
++			goto invalid;
++		for (i = 0; i < DPU_MAX_PLANES; i++) {
++			if (p->left_fetch[i] > 255 || p->left_repeat[i] > 255 ||
++			    p->right_fetch[i] > 255 ||
++			    p->right_repeat[i] > 255 || p->top_fetch[i] > 255 ||
++			    p->top_repeat[i] > 255 ||
++			    p->bottom_fetch[i] > 255 ||
++			    p->bottom_repeat[i] > 255 ||
++			    p->left_fetch[i] > p->src_x ||
++			    p->top_fetch[i] > p->src_y ||
++			    p->src_x + p->src_width + p->right_fetch[i] >
++				    input.fb_width ||
++			    p->src_y + p->src_height + p->bottom_fetch[i] >
++				    input.fb_height ||
++			    p->req_width[i] != p->height ||
++			    p->req_height[i] != p->width)
++				goto invalid;
++		}
++	}
++	p = &result.path[index];
++	for (i = 0; i < DPU_MAX_PLANES; i++) {
++		scale->phase_step_x[i] = result.step_x;
++		scale->phase_step_y[i] = result.step_y;
++		scale->init_phase_x[i] = p->phase_x;
++		scale->init_phase_y[i] = p->phase_y;
++		scale->preload_x[i] = p->preload_x;
++		scale->preload_y[i] = p->preload_y;
++		scale->src_width[i] = p->width;
++		scale->src_height[i] = p->height;
++		ext->left_ftch[i] = p->left_fetch[i];
++		ext->left_rpt[i] = p->left_repeat[i];
++		ext->right_ftch[i] = p->right_fetch[i];
++		ext->right_rpt[i] = p->right_repeat[i];
++		ext->top_ftch[i] = p->top_fetch[i];
++		ext->top_rpt[i] = p->top_repeat[i];
++		ext->btm_ftch[i] = p->bottom_fetch[i];
++		ext->btm_rpt[i] = p->bottom_repeat[i];
++		ext->num_ext_pxls_left[i] = p->req_width[i];
++		ext->num_ext_pxls_right[i] = 0;
++		ext->num_ext_pxls_top[i] = p->req_height[i];
++		ext->num_ext_pxls_btm[i] = 0;
++		ext->roi_w[i] = 0;
++		ext->roi_h[i] = 0;
++	}
++	return true;
++invalid:
++	dev_warn_ratelimited(
++		dev,
++		"QSEED binary geometry/range validation failed: src %ux%u dst %ux%u pipes %u; using existing scaler\n",
++		input.src_width, input.src_height, state->dst.x2, state->dst.y2,
++		count);
++#endif
++	return false;
++}
++
+ static void _dpu_plane_setup_scaler(struct dpu_sw_pipe *pipe,
+ 		const struct msm_format *fmt, bool color_fill,
+-		struct dpu_sw_pipe_cfg *pipe_cfg)
++		struct dpu_sw_pipe_cfg *pipe_cfg,
++		const struct drm_plane_state *state)
+ {
+ 	struct dpu_hw_sspp *pipe_hw = pipe->sspp;
+ 	const struct drm_format_info *info = drm_format_info(fmt->pixel_format);
+@@ -559,6 +703,10 @@ static void _dpu_plane_setup_scaler(struct dpu_sw_pipe *pipe,
+ 	_dpu_plane_setup_pixel_ext(&scaler3_cfg, &pixel_ext,
+ 			src_width, src_height, info->hsub, info->vsub);
+ 
++	if (!color_fill)
++		dpu_plane_setup_binary_qseed(state, pipe, pipe_cfg, fmt, info,
++						   &scaler3_cfg, &pixel_ext);
++
+ 	if (pipe_hw->ops.setup_pe)
+ 		pipe_hw->ops.setup_pe(pipe_hw,
+ 				&pixel_ext);
+@@ -605,7 +753,7 @@ static void _dpu_plane_color_fill_pipe(struct dpu_plane_state *pstate,
+ 	if (pipe->sspp->ops.setup_rects)
+ 		pipe->sspp->ops.setup_rects(pipe, &pipe_cfg);
+ 
+-	_dpu_plane_setup_scaler(pipe, fmt, true, &pipe_cfg);
++	_dpu_plane_setup_scaler(pipe, fmt, true, &pipe_cfg, NULL);
+ }
+ 
+ /**
+@@ -1528,7 +1676,7 @@ static void dpu_plane_sspp_update_pipe(struct drm_plane *plane,
+ 				pipe_cfg);
+ 	}
+ 
+-	_dpu_plane_setup_scaler(pipe, fmt, false, pipe_cfg);
++	_dpu_plane_setup_scaler(pipe, fmt, false, pipe_cfg, state);
+ 
+ 	if (pipe->sspp->ops.setup_multirect)
+ 		pipe->sspp->ops.setup_multirect(
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_qseed_compat.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_qseed_compat.c
+new file mode 100644
+index 0000000..1e7a170
+--- /dev/null
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_qseed_compat.c
+@@ -0,0 +1,510 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Qualcomm stock-QSEED adapter. The pinned opaque ELF is supplied separately. */
++#include <linux/device.h>
++#include <linux/firmware.h>
++#include <linux/jiffies.h>
++#include <linux/mutex.h>
++#include <linux/module.h>
++#include <crypto/sha2.h>
++#include "dpu_qseed_compat.h"
++#include <linux/kernel.h>
++#include <linux/execmem.h>
++#include <linux/fpu.h>
++#include <linux/slab.h>
++#include <linux/sizes.h>
++#include <linux/vmalloc.h>
++#include <asm/cacheflush.h>
++#include <asm/fpsimd.h>
++#include <asm/set_memory.h>
++#include <asm/simd.h>
++#include "dpu_qseed_data.h"
++
++extern long dpu_qseed_invoke(void *save, void *fn, unsigned long a,
++			     unsigned long b, unsigned long c, unsigned long d);
++extern void dpu_qseed_escape(void *save) __noreturn;
++static u64 jump_state[14];
++static DEFINE_MUTEX(qs_lock);
++static u8 *qs_base, *qs_work;
++static unsigned long qs_retry;
++static const char *qs_stage;
++static bool qs_disabled;
++struct qs_cached {
++	bool valid;
++	struct dpu_qseed_input input;
++	struct dpu_qseed_result result;
++};
++static struct qs_cached qs_cache[4];
++static unsigned int qs_next_cache;
++static u8 *arena;
++static size_t arena_used;
++static unsigned int unexpected;
++static const char *qs_bad_import;
++static void *stdout_fake;
++static unsigned long guard = 0x2a9c7015ec34d800;
++static u64 private_tls[16] = { [5] = 0x2a9c7015ec34d800 };
++
++static void *qs_copy(void *d, const void *s, size_t n)
++{
++	return memcpy(d, s, n);
++}
++static void *qs_clear(void *d, int c, size_t n)
++{
++	return memset(d, c, n);
++}
++static void qs_unexpected(void)
++{
++	unexpected++;
++	dpu_qseed_escape(jump_state);
++}
++static void *qs_new(size_t size)
++{
++	void *p;
++	if (size > SZ_1M - arena_used || ALIGN(size, 16) > SZ_1M - arena_used) {
++		qs_unexpected();
++		return NULL;
++	}
++	p = arena + arena_used;
++	arena_used += ALIGN(size, 16);
++	return p;
++}
++static void qs_delete(void *p)
++{
++}
++static int qs_property(const char *key, char *value)
++{
++	*value = 0;
++	return 0;
++}
++static int qs_atexit(void *a, void *b, void *c)
++{
++	return 0;
++}
++static void qs_finalize(void *p)
++{
++}
++static unsigned long qs_auxval(unsigned long key)
++{
++	return key == 16 ? 3 : 0;
++}
++
++static void qs_missing(unsigned int index)
++{
++	qs_bad_import = qs_imports[index];
++	qs_unexpected();
++}
++static void qs_bad_0(void)
++{
++	qs_missing(0);
++}
++static void qs_bad_1(void)
++{
++	qs_missing(1);
++}
++static void qs_bad_2(void)
++{
++	qs_missing(2);
++}
++static void qs_bad_3(void)
++{
++	qs_missing(3);
++}
++static void qs_bad_4(void)
++{
++	qs_missing(4);
++}
++static void qs_bad_5(void)
++{
++	qs_missing(5);
++}
++static void qs_bad_6(void)
++{
++	qs_missing(6);
++}
++static void qs_bad_7(void)
++{
++	qs_missing(7);
++}
++static void qs_bad_8(void)
++{
++	qs_missing(8);
++}
++static void qs_bad_9(void)
++{
++	qs_missing(9);
++}
++static void qs_bad_10(void)
++{
++	qs_missing(10);
++}
++static void qs_bad_11(void)
++{
++	qs_missing(11);
++}
++static void qs_bad_12(void)
++{
++	qs_missing(12);
++}
++static void qs_bad_13(void)
++{
++	qs_missing(13);
++}
++static void qs_bad_14(void)
++{
++	qs_missing(14);
++}
++static void qs_bad_15(void)
++{
++	qs_missing(15);
++}
++static void qs_bad_16(void)
++{
++	qs_missing(16);
++}
++static void qs_bad_17(void)
++{
++	qs_missing(17);
++}
++static void qs_bad_18(void)
++{
++	qs_missing(18);
++}
++static void qs_bad_19(void)
++{
++	qs_missing(19);
++}
++static void qs_bad_20(void)
++{
++	qs_missing(20);
++}
++static void qs_bad_21(void)
++{
++	qs_missing(21);
++}
++static void qs_bad_22(void)
++{
++	qs_missing(22);
++}
++static void qs_bad_23(void)
++{
++	qs_missing(23);
++}
++static void qs_bad_24(void)
++{
++	qs_missing(24);
++}
++static void qs_bad_25(void)
++{
++	qs_missing(25);
++}
++static void qs_bad_26(void)
++{
++	qs_missing(26);
++}
++static void (*const qs_bad_imports[])(void) = {
++	qs_bad_0,  qs_bad_1,  qs_bad_2,	 qs_bad_3,  qs_bad_4,  qs_bad_5,
++	qs_bad_6,  qs_bad_7,  qs_bad_8,	 qs_bad_9,  qs_bad_10, qs_bad_11,
++	qs_bad_12, qs_bad_13, qs_bad_14, qs_bad_15, qs_bad_16, qs_bad_17,
++	qs_bad_18, qs_bad_19, qs_bad_20, qs_bad_21, qs_bad_22, qs_bad_23,
++	qs_bad_24, qs_bad_25, qs_bad_26
++};
++
++static unsigned long qs_external(const char *name)
++{
++#define FN(n, f)              \
++	if (!strcmp(name, n)) \
++	return (unsigned long)(f)
++	FN("memcpy", qs_copy);
++	FN("memset", qs_clear);
++	FN("_Znwm", qs_new);
++	FN("_Znam", qs_new);
++	FN("_ZdlPv", qs_delete);
++	FN("_ZdaPv", qs_delete);
++	FN("__system_property_get", qs_property);
++	FN("__cxa_atexit", qs_atexit);
++	FN("__cxa_finalize", qs_finalize);
++	FN("getauxval", qs_auxval);
++	FN("strlen", strlen);
++	FN("strncmp", strncmp);
++	FN("stdout", &stdout_fake);
++	FN("__stack_chk_guard", &guard);
++#undef FN
++	{
++		unsigned int i;
++		for (i = 0; i < ARRAY_SIZE(qs_imports); i++)
++			if (!strcmp(name, qs_imports[i]))
++				return (unsigned long)qs_bad_imports[i];
++	}
++	return (unsigned long)qs_unexpected;
++}
++
++static long qs_call(void *fn, void *a, void *b, void *c, unsigned long d)
++{
++	u64 fpcr, fpsr;
++	long ret;
++	if (!may_use_simd())
++		return -EAGAIN;
++	kernel_fpu_begin();
++	fpcr = read_sysreg_s(SYS_FPCR);
++	fpsr = read_sysreg_s(SYS_FPSR);
++	write_sysreg_s(0, SYS_FPCR);
++	write_sysreg_s(0, SYS_FPSR);
++	ret = dpu_qseed_invoke(jump_state, fn, (unsigned long)a,
++			       (unsigned long)b, (unsigned long)c, d);
++	write_sysreg_s(fpcr, SYS_FPCR);
++	write_sysreg_s(fpsr, SYS_FPSR);
++	kernel_fpu_end();
++	return ret;
++}
++
++/* The pinned ABI is private to this driver, never a userspace/kernel ABI. */
++static void qs_decode(const u32 *raw, struct dpu_qseed_result *result)
++{
++	unsigned int n, c;
++	memset(result, 0, sizeof(*result));
++	result->step_x = raw[6];
++	result->step_y = raw[7];
++	for (n = 0; n < 2; n++) {
++		const u32 *p = raw + n * 130;
++		struct dpu_qseed_path *d = &result->path[n];
++		d->src_x = p[10];
++		d->src_y = p[11];
++		d->src_width = p[12];
++		d->src_height = p[13];
++		d->dst_width = p[14];
++		d->dst_height = p[15];
++		d->dst_x = p[16];
++		d->dst_y = p[17];
++		d->phase_x = p[58];
++		d->phase_y = p[59];
++		d->preload_x = p[62];
++		d->preload_y = p[63];
++		d->width = p[66];
++		d->height = p[67];
++		for (c = 0; c < 4; c++) {
++			d->left_repeat[c] = p[18 + c];
++			d->left_fetch[c] = p[22 + c];
++			d->right_repeat[c] = p[26 + c];
++			d->right_fetch[c] = p[30 + c];
++			d->top_repeat[c] = p[34 + c];
++			d->top_fetch[c] = p[38 + c];
++			d->bottom_repeat[c] = p[42 + c];
++			d->bottom_fetch[c] = p[46 + c];
++			d->req_width[c] = p[50 + c];
++			d->req_height[c] = p[54 + c];
++		}
++	}
++}
++
++static int qs_load(struct device *dev)
++{
++	static const u8 expected[SHA256_DIGEST_SIZE] = {
++		0xed, 0xf5, 0x65, 0x56, 0xef, 0x87, 0x8c, 0x24,
++		0xcf, 0xc1, 0x6d, 0x04, 0xa5, 0x7e, 0x0c, 0xea,
++		0x50, 0xbf, 0xba, 0x20, 0x15, 0xa1, 0xac, 0xa8,
++		0x5d, 0x51, 0x0f, 0x87, 0x0e, 0xcb, 0xac, 0x39
++	};
++	static const u32 segments[][2] = { { 0, 0x12224 },
++					   { 0x14000, 0x39218 },
++					   { 0x50000, 0x7d8 },
++					   { 0x54000, 0x2a10 } };
++	const struct firmware *fw;
++	u8 digest[SHA256_DIGEST_SIZE];
++	u32 init[19] = { 0x1050007, 8, 8, 1 };
++	unsigned int i;
++	int ret;
++
++	unexpected = 0;
++	qs_bad_import = NULL;
++	qs_stage = "firmware load";
++	ret = request_firmware_direct(&fw, "qcom/libqseed3.so", dev);
++	if (ret)
++		return ret;
++	qs_stage = "firmware checksum";
++	sha256(fw->data, fw->size, digest);
++	if (fw->size != 356840 || memcmp(digest, expected, sizeof(digest))) {
++		release_firmware(fw);
++		return -EBADMSG;
++	}
++	qs_stage = "memory allocation";
++	arena = vzalloc(SZ_1M);
++	qs_base = execmem_alloc_rw(EXECMEM_DEFAULT, 0x5c000);
++	qs_work = kvzalloc(760 + 1036 + 3008, GFP_KERNEL);
++	if (!arena || !qs_base || !qs_work) {
++		ret = -ENOMEM;
++		goto release;
++	}
++	memset(qs_base, 0, 0x5c000);
++	for (i = 0; i < ARRAY_SIZE(segments); i++)
++		memcpy(qs_base + segments[i][0], fw->data + segments[i][0],
++		       segments[i][1]);
++	for (i = 0; i < ARRAY_SIZE(qs_relocs); i++) {
++		const struct qs_reloc *r = &qs_relocs[i];
++		u64 v = r->external ? qs_external(qs_imports[r->external - 1]) :
++				      (u64)qs_base;
++		*(u64 *)(qs_base + r->offset) = v + r->addend;
++	}
++	/* Substitute Android TLS canary reads without changing task TPIDR_EL0. */
++	*(u64 *)(qs_base + QS_TLS_LITERAL) = (u64)private_tls;
++	for (i = 0; i < ARRAY_SIZE(qs_tls_reads); i++) {
++		u32 a = qs_tls_reads[i], v = *(u32 *)(qs_base + a);
++		u32 delta = ((s32)QS_TLS_LITERAL - (s32)a) / 4;
++		*(u32 *)(qs_base + a) = 0x58000000 | ((delta & 0x7ffff) << 5) |
++					(v & 31);
++	}
++	/* Disable formatting only; scaler calculation instructions stay unchanged. */
++	for (i = 0; i < ARRAY_SIZE(qs_log_entries); i++) {
++		*(u32 *)(qs_base + qs_log_entries[i]) = 0xd503245f;
++		*(u32 *)(qs_base + qs_log_entries[i] + 4) = 0xd65f03c0;
++	}
++	qs_stage = "memory protections";
++	ret = set_memory_ro((unsigned long)qs_base, 0x50000 / PAGE_SIZE);
++	if (ret)
++		goto release;
++	ret = set_memory_x((unsigned long)qs_base + 0x14000,
++			   0x3c000 / PAGE_SIZE);
++	if (ret)
++		goto release;
++	flush_icache_range((unsigned long)qs_base + 0x14000,
++			   (unsigned long)qs_base + 0x50000);
++	qs_stage = "constructors";
++	for (i = 0; i < ARRAY_SIZE(qs_ctors); i++) {
++		qs_call(qs_base + qs_ctors[i], NULL, NULL, NULL, 0);
++		if (unexpected) {
++			ret = -EOPNOTSUPP;
++			goto release;
++		}
++	}
++	qs_stage = "library version";
++	if (qs_call(qs_base + QS_VERSION, NULL, NULL, NULL, 0) != 0x1050007) {
++		ret = -EINVAL;
++		goto release;
++	}
++	qs_stage = "library init";
++	ret = qs_call(qs_base + QS_INIT, init, NULL, NULL, 0);
++	if (unexpected)
++		ret = -EOPNOTSUPP;
++	if (!ret)
++		dev_info(
++			dev,
++			"QSEED 1.5.7 binary calculator ready (bilinear override, RX text, RW/NX data)\n");
++release:
++	release_firmware(fw);
++	if (ret) {
++		if (qs_base)
++			execmem_free(qs_base);
++		vfree(arena);
++		kvfree(qs_work);
++		qs_base = NULL;
++		arena = NULL;
++		qs_work = NULL;
++		arena_used = 0;
++		unexpected = 0;
++	}
++	return ret;
++}
++
++int dpu_qseed_calculate(struct device *dev, const struct dpu_qseed_input *in,
++			struct dpu_qseed_result *result)
++{
++	u32 *input, *output, *force;
++	unsigned int i, slot;
++	int ret = 0;
++	if (!in_task() || in_atomic() || irqs_disabled() || !may_use_simd()) {
++		dev_warn_ratelimited(
++			dev,
++			"QSEED binary: invalid execution context; using existing scaler\n");
++		return -EAGAIN;
++	}
++	mutex_lock(&qs_lock);
++	qs_stage = "input validation";
++	if (!in->fb_width || !in->fb_height || in->fb_width > 8192 ||
++	    in->fb_height > 8192 || in->src_width < 32 ||
++	    in->src_width > 8192 || in->src_height < 32 ||
++	    in->src_height > 8192 || in->src_x > in->fb_width ||
++	    in->src_width > in->fb_width - in->src_x ||
++	    in->src_y > in->fb_height ||
++	    in->src_height > in->fb_height - in->src_y || !in->dst_width[0] ||
++	    in->dst_width[0] > 8192 || in->dst_width[1] > 8192 ||
++	    in->dst_width[0] + in->dst_width[1] > 8192 ||
++	    !in->dst_height || in->dst_height > 8192 || in->ten_bit > 1) {
++		ret = -EINVAL;
++		goto fail;
++	}
++	if (qs_disabled) {
++		ret = -EOPNOTSUPP;
++		goto unlock;
++	}
++	if (!qs_base) {
++		if (qs_retry && time_before(jiffies, qs_retry)) {
++			ret = -EAGAIN;
++			goto unlock;
++		}
++		qs_retry = jiffies + 5 * HZ;
++		ret = qs_load(dev);
++		if (ret)
++			goto fail;
++	}
++	for (i = 0; i < ARRAY_SIZE(qs_cache); i++)
++		if (qs_cache[i].valid &&
++		    !memcmp(&qs_cache[i].input, in, sizeof(*in))) {
++			*result = qs_cache[i].result;
++			goto unlock;
++		}
++	qs_stage = "calculation";
++	unexpected = 0;
++	qs_bad_import = NULL;
++	input = (u32 *)qs_work;
++	force = (u32 *)(qs_work + 760);
++	output = (u32 *)(qs_work + 760 + 1036);
++	memset(qs_work, 0, 760 + 1036 + 3008);
++	input[1] = 2;
++	input[2] = 1;
++	input[3] = in->dst_width[1] ? 1 : 0;
++	input[6] = 16 | 1024 | (in->ten_bit ? 128 : 0);
++	input[10] = in->fb_width;
++	input[11] = in->fb_height;
++	input[12] = in->src_x;
++	input[13] = in->src_y;
++	input[14] = in->src_width;
++	input[15] = in->src_height;
++	input[16] = in->dst_width[0];
++	input[17] = in->dst_width[1];
++	input[20] = in->dst_height;
++	input[21] =
++		15; /* Repeat outer ROI edges; fetch only across the interior split. */
++	/* Original process() 0x17a20: override bit 2 reads y_rgb_cfg at offset 12.
++	 * Select the existing bilinear filter before the library computes sampling. */
++	force[0] = BIT(2);
++	force[3] = 3;
++	ret = qs_call(qs_base + QS_CALC, input, qs_work + 760, output, 0);
++	if (unexpected) {
++		ret = -EOPNOTSUPP;
++		qs_disabled = true;
++	}
++	if (ret)
++		goto fail;
++	/* Keep the driver's existing bilinear filters; other filter modes fall back. */
++	qs_stage = "filter validation";
++	if (output[2] != 3 || output[3] != 1 || output[4] != 1) {
++		ret = -ERANGE;
++		goto fail;
++	}
++	qs_decode(output, result);
++	slot = qs_next_cache++ % ARRAY_SIZE(qs_cache);
++	qs_cache[slot].input = *in;
++	qs_cache[slot].result = *result;
++	qs_cache[slot].valid = true;
++	goto unlock;
++fail:
++	dev_warn_ratelimited(
++		dev,
++		"QSEED binary %s failed (%d), src %ux%u+%u+%u fb %ux%u dst %u+%ux%u unsupported=%s; using existing scaler\n",
++		qs_stage, ret, in->src_width, in->src_height, in->src_x,
++		in->src_y, in->fb_width, in->fb_height, in->dst_width[0],
++		in->dst_width[1], in->dst_height, qs_bad_import ?: "none");
++unlock:
++	mutex_unlock(&qs_lock);
++	return ret;
++}
++
++MODULE_FIRMWARE("qcom/libqseed3.so");
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_qseed_compat.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_qseed_compat.h
+new file mode 100644
+index 0000000..8a3cf99
+--- /dev/null
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_qseed_compat.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _DPU_QSEED_COMPAT_H
++#define _DPU_QSEED_COMPAT_H
++#include <linux/types.h>
++struct device;
++
++struct dpu_qseed_input {
++	u32 fb_width, fb_height;
++	u32 src_x, src_y, src_width, src_height;
++	u32 dst_width[2], dst_height;
++	u32 ten_bit;
++};
++
++struct dpu_qseed_path {
++	u32 src_x, src_y, src_width, src_height;
++	u32 dst_x, dst_y, dst_width, dst_height;
++	u32 phase_x, phase_y, preload_x, preload_y, width, height;
++	u32 left_fetch[4], left_repeat[4], right_fetch[4], right_repeat[4];
++	u32 top_fetch[4], top_repeat[4], bottom_fetch[4], bottom_repeat[4];
++	u32 req_width[4], req_height[4];
++};
++
++struct dpu_qseed_result {
++	u32 step_x, step_y;
++	struct dpu_qseed_path path[2];
++};
++
++int dpu_qseed_calculate(struct device *dev, const struct dpu_qseed_input *in,
++			struct dpu_qseed_result *out);
++#endif
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_qseed_data.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_qseed_data.h
+new file mode 100644
+index 0000000..9d2a3a2
+--- /dev/null
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_qseed_data.h
+@@ -0,0 +1,116 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Relocation metadata for the SHA-256-pinned QSEED 1.5.7 ELF; no code payload. */
++struct qs_reloc {
++	u32 offset, external;
++	s64 addend;
++};
++static const struct qs_reloc qs_relocs[] = {
++	{ 0x50220, 0, 355016 }, { 0x50228, 0, 374768 }, { 0x50230, 0, 374772 },
++	{ 0x50238, 1, 0 },	{ 0x50240, 0, 311432 }, { 0x50248, 0, 311592 },
++	{ 0x50250, 0, 311656 }, { 0x50258, 0, 311424 }, { 0x50260, 0, 311584 },
++	{ 0x50268, 0, 311648 }, { 0x50270, 0, 311440 }, { 0x50278, 0, 311600 },
++	{ 0x50280, 0, 311664 }, { 0x50288, 0, 311448 }, { 0x50290, 0, 311608 },
++	{ 0x50298, 0, 311672 }, { 0x502a0, 0, 312080 }, { 0x502a8, 0, 311616 },
++	{ 0x502b0, 0, 311680 }, { 0x502b8, 0, 312088 }, { 0x502c0, 0, 311624 },
++	{ 0x502c8, 0, 311688 }, { 0x502d0, 0, 312096 }, { 0x502d8, 0, 311632 },
++	{ 0x502e0, 0, 311696 }, { 0x502e8, 0, 345404 }, { 0x502f0, 0, 346204 },
++	{ 0x502f8, 0, 348364 }, { 0x50300, 0, 344084 }, { 0x50308, 0, 344064 },
++	{ 0x50310, 0, 45080 },	{ 0x50318, 0, 45840 },	{ 0x50320, 0, 46876 },
++	{ 0x50328, 0, 49900 },	{ 0x50330, 0, 49956 },	{ 0x50338, 0, 50412 },
++	{ 0x50340, 0, 51068 },	{ 0x50348, 0, 51232 },	{ 0x50350, 0, 51612 },
++	{ 0x50358, 0, 53692 },	{ 0x50360, 2, 0 },	{ 0x50000, 0, 327680 },
++	{ 0x50008, 0, 81944 },	{ 0x50010, 0, 81920 },	{ 0x50018, 0, 87556 },
++	{ 0x50020, 0, 89144 },	{ 0x50028, 0, 128628 }, { 0x50380, 3, 0 },
++	{ 0x50388, 4, 0 },	{ 0x50390, 0, 90168 },	{ 0x50398, 0, 90640 },
++	{ 0x503a0, 0, 91044 },	{ 0x503a8, 0, 95272 },	{ 0x503b0, 0, 106548 },
++	{ 0x503b8, 0, 102556 }, { 0x503c0, 0, 118668 }, { 0x503c8, 0, 114408 },
++	{ 0x503d0, 0, 117620 }, { 0x503d8, 0, 117920 }, { 0x503e0, 0, 118448 },
++	{ 0x503e8, 0, 112244 }, { 0x503f0, 0, 107540 }, { 0x503f8, 0, 108964 },
++	{ 0x50400, 0, 109348 }, { 0x50408, 0, 111448 }, { 0x50410, 0, 111912 },
++	{ 0x50418, 0, 89312 },	{ 0x50420, 0, 89672 },	{ 0x50428, 0, 310848 },
++	{ 0x50430, 0, 311152 }, { 0x50438, 0, 83012 },	{ 0x50440, 0, 83444 },
++	{ 0x50448, 0, 83228 },	{ 0x50450, 0, 310464 }, { 0x50458, 5, 0 },
++	{ 0x50460, 6, 0 },	{ 0x50468, 7, 0 },	{ 0x50470, 0, 310352 },
++	{ 0x50478, 0, 83660 },	{ 0x50480, 0, 310528 }, { 0x50488, 0, 144380 },
++	{ 0x50490, 0, 144980 }, { 0x50498, 0, 152676 }, { 0x504a0, 0, 132956 },
++	{ 0x504a8, 0, 160492 }, { 0x504b0, 0, 170296 }, { 0x504b8, 0, 170844 },
++	{ 0x504c0, 0, 141224 }, { 0x504c8, 0, 172732 }, { 0x504d0, 0, 132588 },
++	{ 0x504d8, 0, 144136 }, { 0x504e0, 0, 144340 }, { 0x504e8, 8, 0 },
++	{ 0x504f0, 9, 0 },	{ 0x504f8, 0, 310656 }, { 0x50500, 10, 0 },
++	{ 0x50508, 11, 0 },	{ 0x50510, 12, 0 },	{ 0x50518, 13, 0 },
++	{ 0x50520, 0, 143736 }, { 0x50528, 0, 143504 }, { 0x50530, 0, 144564 },
++	{ 0x50538, 0, 145148 }, { 0x50540, 0, 159656 }, { 0x50548, 0, 152032 },
++	{ 0x50550, 0, 169720 }, { 0x50558, 0, 152844 }, { 0x50560, 0, 160660 },
++	{ 0x50568, 0, 171012 }, { 0x50570, 0, 170472 }, { 0x50578, 0, 172900 },
++	{ 0x50580, 0, 164188 }, { 0x50588, 0, 143468 }, { 0x50590, 14, 0 },
++	{ 0x50598, 0, 312288 }, { 0x505a0, 0, 312336 }, { 0x505a8, 0, 312352 },
++	{ 0x505b0, 0, 312384 }, { 0x505b8, 0, 312400 }, { 0x505c0, 0, 312320 },
++	{ 0x505c8, 0, 312272 }, { 0x505d0, 0, 310864 }, { 0x505d8, 0, 310880 },
++	{ 0x505e0, 0, 310960 }, { 0x505e8, 0, 310976 }, { 0x505f0, 0, 311008 },
++	{ 0x505f8, 0, 311056 }, { 0x50600, 0, 311168 }, { 0x50608, 0, 311184 },
++	{ 0x50610, 0, 311200 }, { 0x50618, 0, 311216 }, { 0x50620, 0, 311232 },
++	{ 0x50628, 0, 311264 }, { 0x50630, 0, 311280 }, { 0x50638, 0, 83876 },
++	{ 0x50640, 0, 311328 }, { 0x50648, 0, 311360 }, { 0x50650, 0, 311392 },
++	{ 0x50658, 15, 0 },	{ 0x50660, 0, 311720 }, { 0x50668, 0, 311296 },
++	{ 0x50670, 0, 311368 }, { 0x50678, 0, 311400 }, { 0x50680, 0, 311336 },
++	{ 0x50688, 0, 311376 }, { 0x50690, 0, 311408 }, { 0x50698, 0, 311312 },
++	{ 0x506a0, 0, 311344 }, { 0x506a8, 0, 311384 }, { 0x506b0, 0, 311416 },
++	{ 0x506b8, 0, 311872 }, { 0x506c0, 0, 311904 }, { 0x506c8, 0, 311840 },
++	{ 0x506d0, 0, 311968 }, { 0x506d8, 0, 312000 }, { 0x506e0, 0, 312032 },
++	{ 0x506e8, 0, 311880 }, { 0x506f0, 0, 311912 }, { 0x506f8, 0, 311848 },
++	{ 0x50700, 0, 311976 }, { 0x50708, 0, 312008 }, { 0x50710, 0, 312040 },
++	{ 0x50718, 0, 311888 }, { 0x50720, 0, 311920 }, { 0x50728, 0, 311856 },
++	{ 0x50730, 0, 311896 }, { 0x50738, 0, 311928 }, { 0x50740, 0, 311936 },
++	{ 0x50748, 0, 311952 }, { 0x50750, 0, 311984 }, { 0x50758, 0, 312016 },
++	{ 0x50760, 0, 312048 }, { 0x50768, 0, 312064 }, { 0x50770, 16, 0 },
++	{ 0x50778, 17, 0 },	{ 0x50780, 2, 0 },	{ 0x50788, 18, 0 },
++	{ 0x50790, 19, 0 },	{ 0x50798, 20, 0 },	{ 0x507a0, 21, 0 },
++	{ 0x507a8, 22, 0 },	{ 0x507b0, 23, 0 },	{ 0x507b8, 24, 0 },
++	{ 0x507c0, 25, 0 },	{ 0x507c8, 26, 0 },	{ 0x507d0, 27, 0 },
++};
++static const char *const qs_imports[] = {
++	"stdout",
++	"android_set_abort_message",
++	"__cxa_finalize",
++	"__cxa_atexit",
++	"__cfi_slowpath",
++	"fputs",
++	"vsnprintf",
++	"_Znwm",
++	"_ZdlPv",
++	"vfprintf",
++	"fflush",
++	"fopen",
++	"fclose",
++	"printf",
++	"puts",
++	"strlen",
++	"write",
++	"abort",
++	"getauxval",
++	"__system_property_get",
++	"strncmp",
++	"__stack_chk_fail",
++	"memcpy",
++	"memset",
++	"log",
++	"logf",
++	"expf",
++};
++static const u32 qs_ctors[] = { 0x15604, 0x15c38, 0x1f674 };
++#define QS_TLS_LITERAL 0x13000
++static const u32 qs_tls_reads[] = {
++	0x16054, 0x163bc, 0x190c0, 0x1a054, 0x1a438, 0x1a9c8, 0x1ab58, 0x1bf08,
++	0x1cf10, 0x1f26c, 0x1f590, 0x1f614, 0x20534, 0x231bc, 0x23724, 0x25530,
++	0x26fc0, 0x273b8, 0x2817c, 0x29c24, 0x2a384, 0x2ae94, 0x2b130, 0x2bac4,
++	0x2c57c, 0x2cf78, 0x2dbd0, 0x2e65c, 0x2fce4, 0x3077c, 0x32798, 0x32878,
++	0x33150, 0x33c34, 0x35184, 0x36458, 0x36de8, 0x38c28, 0x395e0, 0x3a9a4,
++	0x3af28, 0x3bdb8, 0x3d3d4, 0x3df2c, 0x3f5a4, 0x3fb28, 0x40cdc, 0x418cc,
++	0x42f4c, 0x43a04, 0x43f94, 0x44800, 0x44f94, 0x45750, 0x45bcc, 0x494bc,
++	0x4a4a8, 0x4a804, 0x4ac7c, 0x4b7f4, 0x4b878, 0x4b8e8, 0x4b99c, 0x4ba50,
++	0x4bb0c, 0x4bbd8
++};
++static const u32 qs_log_entries[] = { 0x23178, 0x23090 };
++#define QS_VERSION 0x4bd28
++#define QS_INIT 0x4bc70
++#define QS_CALC 0x4bc90
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_qseed_invoke.S b/drivers/gpu/drm/msm/disp/dpu1/dpu_qseed_invoke.S
+new file mode 100644
+index 0000000..639a391
+--- /dev/null
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_qseed_invoke.S
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Bounded escape from unsupported firmware dependencies. */
++#include <linux/linkage.h>
++.text
++SYM_FUNC_START(dpu_qseed_invoke)
++	bti c
++	stp x19, x20, [x0, #0]
++	stp x21, x22, [x0, #16]
++	stp x23, x24, [x0, #32]
++	stp x25, x26, [x0, #48]
++	stp x27, x28, [x0, #64]
++	stp x29, x30, [x0, #80]
++	str x18, [x0, #104]
++	mov x9, sp
++	str x9, [x0, #96]
++	mov x19, x0
++	mov x9, x1
++	mov x0, x2
++	mov x1, x3
++	mov x2, x4
++	mov x3, x5
++	blr x9
++	mov x9, x19
++.Lqs_return:
++	ldr x10, [x9, #96]
++	mov sp, x10
++	ldr x18, [x9, #104]
++	ldp x19, x20, [x9, #0]
++	ldp x21, x22, [x9, #16]
++	ldp x23, x24, [x9, #32]
++	ldp x25, x26, [x9, #48]
++	ldp x27, x28, [x9, #64]
++	ldp x29, x30, [x9, #80]
++	ret
++SYM_FUNC_END(dpu_qseed_invoke)
++SYM_FUNC_START(dpu_qseed_escape)
++	bti c
++	mov x9, x0
++	mov x0, #-95
++	b .Lqs_return
++SYM_FUNC_END(dpu_qseed_escape)
